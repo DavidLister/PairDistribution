@@ -183,11 +183,11 @@ def points_within(test_point, points, r):
     return points[mask]
 
 
-
-def find_nearest_distance(test_point, points, max_r):
+def find_nearest_distance(test_point, points, max_r, return_position=False):
     test_r = 5 # nm
     over = False
     out = None
+    pos = None
     while not over:
         if test_r == max_r:
             over = True
@@ -217,8 +217,11 @@ def find_nearest_distance(test_point, points, max_r):
             else:
                 over = True
                 out = distances[min_index]
+                pos = subset[min_index] + test_point
                 # print(f"Selected {out}")
 
+    if return_position:
+        return pos
     return out
 
 
@@ -313,11 +316,21 @@ def calculate_two_step_pair_distribution(crystal, sample_percent=0.01, max_r=50)
 
         if in_bounds(test_position, max_r, plane_100, plane_010, plane_001, bounds_100, bounds_010, bounds_001):
             i += 1
-            r = find_nearest_distance(test_position, dopant_positions, max_r)
-            if r is None:
-                r = max_r
+            nearest = find_nearest_distance(test_position, dopant_positions, max_r, return_position=True)
+            if nearest is None:
+                pass
+                ## Update to correct for lost sample
 
-            distances.append(r)
+            else:
+                index = np.where(nearest == dopant_positions)[0][0]
+                test_mask = blank_mask
+                test_mask[index] = False
+                r = find_nearest_distance(dopant_positions[index], dopant_positions[test_mask], max_r)
+                if r is None:
+                    r = max_r
+                    
+                distances.append(r)
+    
         else:
             rejected_bounds += 1
 
@@ -331,7 +344,7 @@ prob_from_R_nm = lambda R_nm, average_R_nm: ((3 * R_nm**2) / (average_R_nm ** 3)
 
 
 if __name__ == "__main__":
-    nd_test = 10e18
+    nd_test = 1e19
     r_0 = R_avg_nm_from_Nd_cm(nd_test)
     distances_step = []
     distances_pair = []
@@ -340,12 +353,20 @@ if __name__ == "__main__":
     for iteration in range(iterations):
         print(f"\n\n\nIteration {iteration}:\n")
         ZnO = make_ZnO_crystal(nd_test, 1000)
-        distances_step.append(calculate_two_step_pair_distribution(ZnO, max_r=20))
-        distances_pair.append(calculate_pair_distribution(ZnO, max_r=20))
+        out = calculate_two_step_pair_distribution(ZnO, max_r=20)
+        for val in out:
+            distances_step.append(val)
+
+        out = calculate_pair_distribution(ZnO, max_r=20)
+        for val in out:
+            distances_pair.append(val)
 
     plt.hist(distances_pair, bins=100, alpha=0.5, density=True, label="Pair Experimental")
     hst = plt.hist(distances_step, bins=100, alpha=0.5, density=True, label="Two Step")
     plt.plot(hst[1], prob_from_R_nm(hst[1], r_0), label="Pair analytic")
 
+    plt.title("Pair vs Two-step model")
+    plt.xlabel("r (nm)")
+    plt.ylabel("prob")
     plt.legend()
     plt.show()
