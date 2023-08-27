@@ -345,7 +345,7 @@ if __name__ == "__main__":
 
     plt.hist(distances_pair, bins=100, alpha=0.5, density=True, label="Pair Experimental")
     hst = plt.hist(distances_step, bins=100, alpha=0.5, density=True, label="Two Step")
-    plt.plot(hst[1], prob_from_R_nm(hst[1]), label="Pair analytic")
+    plt.plot(hst[1], prob_from_R_nm(hst[1], r_0), label="Pair analytic")
 
     plt.legend()
     plt.show()
