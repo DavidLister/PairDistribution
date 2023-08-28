@@ -6,8 +6,14 @@
 #
 
 import numpy as np
-import matplotlib.pyplot as plt
+from numba import jit
 import time
+import pickle
+import matplotlib.pyplot as plt
+import datetime
+import matplotlib
+matplotlib.use("TkAgg")
+
 
 # Symbolic Constants
 Zn = "Zn"
@@ -49,6 +55,11 @@ class Crystal:
         self.dopant_dict = {}
         self.dopant_positions = []
         self.dopant_coordinates = []
+        self.n_dopants = None
+        self.volume = None
+        self.unit_cell_volume = None
+        self.cells_per_side = None
+        self.nominal_dopant_concentration = None
 
 
 def calculate_unit_cell_volume(struct):
@@ -91,11 +102,11 @@ def get_xyz(struct, path):
     return np.array((total[x], total[y], total[z]))
 
 
-def make_ZnO_crystal(dopant_concentration, n_cells_per_side):
+def make_ZnO_crystal(dopant_concentration, n_dopants):
     """
     Makes a ZnO crystal object.
     :param dopant_concentration: Dopant concentration in units of cm^-3
-    :param n_cells_per_side: Number of unit cells per side of the crystal
+    :param n_dopants: Number of dopants to simulate, size will be scaled accordingly.
     :return: A Crystal object representing a doped ZnO sample.
     """
     start = time.time()
@@ -115,16 +126,20 @@ def make_ZnO_crystal(dopant_concentration, n_cells_per_side):
     unit_cell_volume = calculate_unit_cell_volume(ZnO_struct)
     print(f"Unit cell volume is {unit_cell_volume:0.4}nm^3")
 
+    dopants_per_nm3 = dopant_concentration / 1e21  # ( 10^7 )^3
+    target_volume_nm3 = n_dopants / dopants_per_nm3
+    n_cells_per_side = int((target_volume_nm3/unit_cell_volume)**(1/3))
+
     system_volume = n_cells_per_side**3 * unit_cell_volume
     print(f"System volume is {system_volume:0.1f}nm^3 or equivalent to a cube of {system_volume**(1/3):0.1f}nm per side")
 
-    dopants_per_nm3 = dopant_concentration / 1e21  # ( 10^7 )^3
+
     mean_n_dopants = system_volume * dopants_per_nm3
     print(f"The mean number of dopants in the volume is {mean_n_dopants:0.1f}, adding {int(mean_n_dopants)} dopants")
 
     crystal = Crystal(ZnO_struct, n_cells_per_side)
     report_every = 100000
-    over = False
+
     i = 0
     dopant = Ga
     overlap = 0
@@ -175,6 +190,7 @@ def in_bounds(test_position, r, p100, p010, p001, b100, b010, b001):
     return a_test and b_test and c_test
 
 
+@jit(nopython=True)
 def points_within(test_point, points, r):
     mask = np.full(points.T[0].shape, True)
     for i in range(3):
@@ -184,20 +200,20 @@ def points_within(test_point, points, r):
 
 
 def find_nearest_distance(test_point, points, max_r, return_position=False):
-    test_r = 5 # nm
+    test_r = max_r/5 # nm
     over = False
     out = None
     pos = None
     while not over:
         if test_r == max_r:
             over = True
-            print("No pair found")
+            # print("Last attempt")
 
         subset = points_within(test_point, points, test_r)
         # print(subset.shape)
         if len(subset) < 1:
             test_r = max_r
-            print("Expanding search")
+            # print("Expanding search")
 
         else:
             subset = subset.T
@@ -339,34 +355,118 @@ def calculate_two_step_pair_distribution(crystal, sample_percent=0.01, max_r=50)
     print(f"In total {100 * (rejected_bounds)/(samples + rejected_bounds):2f}% of attempted samples were rejected.")
     return distances
 
-R_avg_nm_from_Nd_cm = lambda Nd_cm: 6**(1/3) / (2 * (np.pi * Nd_cm * 100**3)**(1/3) ) * 1e9
-prob_from_R_nm = lambda R_nm, average_R_nm: ((3 * R_nm**2) / (average_R_nm ** 3)) * np.exp( (-R_nm/average_R_nm)**3 )
+
+gaussian = lambda value, center, fwhm: 1/((fwhm/(2 * np.sqrt(2 * np.log(2)))) * np.sqrt(2 *np.pi)) * np.exp( - (value - center)**2 / (2 * (fwhm/(2 * np.sqrt(2 * np.log(2))))**2))
+
+
+def make_simulated_spectra(E_lst, fwhm, x_axis=None):
+    if x_axis is None:
+        max_E = np.max(E_lst) + fwhm * 10
+        min_E = np.min(E_lst) - fwhm * 10
+        resolution = fwhm / 20
+        x_axis = np.linspace(min_E, max_E, int((max_E - min_E)/resolution))
+
+    out = np.zeros(x_axis.shape)
+    for value in E_lst:
+        out = out + gaussian(x_axis, value, fwhm)
+
+    out = out / len(E_lst)
+    return x_axis, out
+
+
+ZnO_DoX_binding_eV = 0.0156
+ZnO_DoX_bohr_rad_nm = 1.5
+
+delta_E_from_R_nm = lambda r_nm, bohr_rad_nm, binding_energy_eV: -2 * binding_energy_eV * np.exp(-r_nm / bohr_rad_nm)
+
+R_avg_nm_from_Nd_cm = lambda Nd_cm: 6 ** (1 / 3) / (2 * (np.pi * Nd_cm * 100 ** 3) ** (1 / 3)) * 1e9
+R_nm_from_delta_E = lambda delta_E_eV, bohr_rad_nm, binding_energy_eV: -bohr_rad_nm * np.log(-delta_E_eV / (2 * binding_energy_eV))
+prob_from_R_nm = lambda R_nm, average_R_nm: ((3 * R_nm ** 2) / (average_R_nm ** 3)) * np.exp((-R_nm / average_R_nm) ** 3)
+
+pair_model = lambda delta_E_eV, Nd_cm, bohr_rad_nm, binding_energy_eV: ( (3 * R_nm_from_delta_E(delta_E_eV, bohr_rad_nm, binding_energy_eV) ** 2) / (R_avg_nm_from_Nd_cm(Nd_cm)) ) * \
+                                                                         np.exp( (R_nm_from_delta_E(delta_E_eV, bohr_rad_nm, binding_energy_eV)) / (bohr_rad_nm) - (R_nm_from_delta_E(delta_E_eV, bohr_rad_nm, binding_energy_eV) / R_avg_nm_from_Nd_cm(Nd_cm))**3)
 
 
 if __name__ == "__main__":
-    nd_test = 1e19
-    r_0 = R_avg_nm_from_Nd_cm(nd_test)
-    distances_step = []
-    distances_pair = []
+    start_time = time.time()
+    nd_lst = [1e16, 2.5e17, 5e16, 7.5e16,
+              1e17, 2.5e17, 5e17, 7.5e17,
+              1e18, 2.5e18, 5e18, 7.5e18,
+              1e19, 2.5e19, 5e19, 7.5e19,
+              1e20, 2.5e20, 5e20, 7.5e20,
+              1e21]
+    min_samples = 100000
+    min_iterations = 10
+    results = {"pair": {},
+               "step": {}}
 
-    iterations = 10
-    for iteration in range(iterations):
-        print(f"\n\n\nIteration {iteration}:\n")
-        ZnO = make_ZnO_crystal(nd_test, 1000)
-        out = calculate_two_step_pair_distribution(ZnO, max_r=20)
-        for val in out:
-            distances_step.append(val)
+    cycle = 0
+    while True:  # run forever
+        cycle += 1
+        for nd_test in nd_lst:
+            r_0 = R_avg_nm_from_Nd_cm(nd_test)
+            distances_step = []
+            distances_pair = []
 
-        out = calculate_pair_distribution(ZnO, max_r=20)
-        for val in out:
-            distances_pair.append(val)
+            over = False
+            iteration = 0
+            while not over:
+                iteration += 1
+                print(f"\n\n\n\nIteration {iteration + 1} at Nd = {nd_test:.2E}. {len(distances_step)}  samples collected so far:\n")
+                ZnO = make_ZnO_crystal(nd_test, 250000)
+                out = calculate_two_step_pair_distribution(ZnO, max_r=5*r_0)
+                for val in out:
+                    distances_step.append(val)
 
-    plt.hist(distances_pair, bins=100, alpha=0.5, density=True, label="Pair Experimental")
-    hst = plt.hist(distances_step, bins=100, alpha=0.5, density=True, label="Two Step")
-    plt.plot(hst[1], prob_from_R_nm(hst[1], r_0), label="Pair analytic")
+                out = calculate_pair_distribution(ZnO, max_r=5*r_0)
+                for val in out:
+                    distances_pair.append(val)
 
-    plt.title("Pair vs Two-step model")
-    plt.xlabel("r (nm)")
-    plt.ylabel("prob")
-    plt.legend()
-    plt.show()
+                if iteration >= min_iterations and len(distances_step) >= min_samples:
+                    over = True
+
+                elif iteration <= min_iterations:
+                    print(f"Need more iterations! {100 * iteration / min_iterations}% complete")
+
+                else:
+                    print(f"Need more samples! {100 * len(distances_step) / min_samples}% complete")
+
+            results["pair"][nd_test] = np.array(distances_pair)
+            results["step"][nd_test] = np.array(distances_step)
+
+            fname = "Data_Capture_" + datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".data"
+            with open(fname, 'wb') as f:
+                pickle.dump(results)
+
+            print(f"Time taken: {(time.time() - start_time) / 3600} hours, finished cycle {cycle}.")
+
+    # Plotting results not presently used.
+    for nd_test in nd_lst:
+        r_0 = R_avg_nm_from_Nd_cm(nd_test)
+        plt.hist(results["pair"][nd_test], bins=100, alpha=0.5, density=True, label="Pair Experimental")
+        hst = plt.hist(results["step"][nd_test], bins=100, alpha=0.5, density=True, label="Two Step")
+        plt.plot(hst[1], prob_from_R_nm(hst[1], r_0), label="Pair analytic")
+
+        plt.title(f"Pair vs Two-step model for Nd = {nd_test:.1} cm^-3")
+        plt.xlabel("r (nm)")
+        plt.ylabel("prob")
+        plt.legend()
+        plt.show()
+
+        simulated_fwhm = 1e-4
+        delta_E_pair_eV = delta_E_from_R_nm(results["pair"][nd_test], ZnO_DoX_bohr_rad_nm, ZnO_DoX_binding_eV)
+        energy_axis, pair_E_spectra = make_simulated_spectra(delta_E_pair_eV, simulated_fwhm)
+        delta_E_step_eV = delta_E_from_R_nm(results["step"][nd_test], ZnO_DoX_bohr_rad_nm, ZnO_DoX_binding_eV)
+        skip, step_E_spectra = make_simulated_spectra(delta_E_step_eV, simulated_fwhm, x_axis=energy_axis)
+        pair_analytic = pair_model(energy_axis, nd_test, ZnO_DoX_bohr_rad_nm, ZnO_DoX_binding_eV)
+
+        plt.semilogy(energy_axis, pair_E_spectra, label="Pair experimental")
+        plt.semilogy(energy_axis, step_E_spectra, label="Step experimental")
+        plt.semilogy(energy_axis, pair_analytic, label="Pair analytic")
+
+        plt.title(f"Energy spectra Pair vs Two-step model for Nd = {nd_test:.1} cm^-3")
+        plt.xlabel("Delta E (eV)")
+        plt.ylabel("prob")
+        plt.legend()
+        plt.show()
+
